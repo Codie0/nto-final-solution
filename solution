@@ -1,0 +1,213 @@
+# 0.767 — без Optunы
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+!pip install -q catboost lightgbm transformers sentencepiece scikit-learn
+
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LinearRegression
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+import torch
+from transformers import AutoTokenizer, AutoModel
+from tqdm.auto import tqdm
+import gc
+import random
+
+def set_all_seeds(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+set_all_seeds(42)
+
+DATA_DIR = "/kaggle/input/ntow4ka"
+OUTPUT_DIR = "/kaggle/working"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RATING_MIN, RATING_MAX = 0.0, 10.0
+TEMPORAL_SPLIT_RATIO = 0.85
+MAX_TFIDF = 500
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Device: {DEVICE}")
+
+train_raw = pd.read_csv(f"{DATA_DIR}/train.csv", parse_dates=["timestamp"])
+test_raw = pd.read_csv(f"{DATA_DIR}/test.csv")
+users = pd.read_csv(f"{DATA_DIR}/users.csv")
+books = pd.read_csv(f"{DATA_DIR}/books.csv")
+book_desc = pd.read_csv(f"{DATA_DIR}/book_descriptions.csv")
+book_genres = pd.read_csv(f"{DATA_DIR}/book_genres.csv")
+genres = pd.read_csv(f"{DATA_DIR}/genres.csv")
+sample_sub = pd.read_csv(f"{DATA_DIR}/sample_submission.csv")
+
+train_raw = train_raw[train_raw["has_read"] == 1].copy()
+
+full_books = books.merge(book_desc[["book_id", "description"]], on="book_id", how="left")
+full_books["description"] = full_books["description"].fillna("")
+
+genre_map = dict(zip(genres["genre_id"], genres["genre_name"]))
+book_genres["genre_name"] = book_genres["genre_id"].map(genre_map)
+book_to_genres = book_genres.groupby("book_id")["genre_name"].apply(list).to_dict()
+full_books["genres_str"] = full_books["book_id"].map(
+    lambda x: " ".join(book_to_genres.get(x, [])) if book_to_genres.get(x) else "no_genre"
+)
+
+train = train_raw.merge(users, on="user_id", how="left").merge(full_books, on="book_id", how="left")
+test = test_raw.merge(users, on="user_id", how="left").merge(full_books, on="book_id", how="left")
+
+print("TF-IDF")
+tfidf = TfidfVectorizer(max_features=MAX_TFIDF, ngram_range=(1, 2))
+tfidf.fit(train["description"])
+
+def add_tfidf(df):
+    mat = tfidf.transform(df["description"])
+    cols = [f"tfidf_{i}" for i in range(mat.shape[1])]
+    return pd.concat([df.reset_index(drop=True), pd.DataFrame(mat.toarray(), columns=cols)], axis=1)
+
+train = add_tfidf(train)
+test = add_tfidf(test)
+
+print("BERT embeddings")
+tokenizer = AutoTokenizer.from_pretrained("DeepPavlov/rubert-base-cased")
+model = AutoModel.from_pretrained("DeepPavlov/rubert-base-cased").to(DEVICE)
+model.eval()
+
+def get_bert_embs(texts, batch_size=4, max_len=64):
+    embs = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="BERT", leave=False):
+        batch = texts[i:i+batch_size]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=max_len).to(DEVICE)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        embs.append(outputs.last_hidden_state[:, 0, :].cpu().numpy())
+    return np.vstack(embs)
+
+bert_train = get_bert_embs(train["description"].tolist())
+bert_test = get_bert_embs(test["description"].tolist())
+
+bert_cols = [f"bert_{i}" for i in range(bert_train.shape[1])]
+train = pd.concat([train.reset_index(drop=True), pd.DataFrame(bert_train, columns=bert_cols)], axis=1)
+test = pd.concat([test.reset_index(drop=True), pd.DataFrame(bert_test, columns=bert_cols)], axis=1)
+
+del model, tokenizer
+gc.collect()
+torch.cuda.empty_cache()
+
+print("Temporal split")
+train = train.sort_values("timestamp").reset_index(drop=True)
+split_time = train["timestamp"].quantile(TEMPORAL_SPLIT_RATIO)
+train_data = train[train["timestamp"] < split_time].copy()
+val_data = train[train["timestamp"] >= split_time].copy()
+
+def add_features(df, ref_df, global_mean=5.0):
+    user_mean = ref_df.groupby("user_id")["rating"].mean().rename("user_mean")
+    user_cnt = ref_df.groupby("user_id")["rating"].count().rename("user_cnt")
+    df = df.merge(user_mean, on="user_id", how="left")
+    df = df.merge(user_cnt, on="user_id", how="left")
+    
+    book_mean = ref_df.groupby("book_id")["rating"].mean().rename("book_mean")
+    book_cnt = ref_df.groupby("book_id")["rating"].count().rename("book_cnt")
+    df = df.merge(book_mean, on="book_id", how="left")
+    df = df.merge(book_cnt, on="book_id", how="left")
+    
+    if "author_id" in ref_df.columns:
+        author_mean = ref_df.groupby("author_id")["rating"].mean().rename("author_mean")
+        author_cnt = ref_df.groupby("author_id")["rating"].count().rename("author_cnt")
+        df = df.merge(author_mean, on="author_id", how="left")
+        df = df.merge(author_cnt, on="author_id", how="left")
+    
+    for col in df.columns:
+        if "mean" in col:
+            df[col] = df[col].fillna(global_mean)
+        elif "cnt" in col:
+            df[col] = df[col].fillna(0)
+    return df
+
+train_feats = add_features(train_data, train_data)
+val_feats = add_features(val_data, train_data)
+test_feats = add_features(test, train_raw)
+
+base_cols = ["user_mean", "user_cnt", "book_mean", "book_cnt", "author_mean", "author_cnt", "age"]
+tfidf_cols = [c for c in train_feats.columns if c.startswith("tfidf_")]
+bert_cols_final = [c for c in train_feats.columns if c.startswith("bert_")]
+feature_cols = base_cols + tfidf_cols + bert_cols_final
+
+for col in feature_cols:
+    for df in [train_feats, val_feats, test_feats]:
+        if col not in df.columns:
+            df[col] = 0
+
+X_train = train_feats[feature_cols].fillna(0)
+y_train = train_feats["rating"]
+X_val = val_feats[feature_cols].fillna(0)
+y_val = val_feats["rating"]
+X_test = test_feats[feature_cols].fillna(0)
+
+cat_features = ["gender", "language", "publisher", "author_id"]
+cat_feature_indices = [i for i, col in enumerate(feature_cols) if col in cat_features]
+
+print(f"Признаков: {len(feature_cols)}")
+
+best_params = {
+    "objective": "mae",
+    "metric": ["rmse", "mae"],
+    "num_leaves": 200,
+    "learning_rate": 0.05,
+    "feature_fraction": 0.65,
+    "bagging_fraction": 0.9,
+    "min_data_in_leaf": 140,
+    "lambda_l1": 1e-5,
+    "lambda_l2": 1e-6,
+    "seed": 42,
+    "verbose": -1
+}
+
+lgb_train_full = lgb.Dataset(X_train, y_train)
+lgb_val_full = lgb.Dataset(X_val, y_val)
+model_lgb = lgb.train(
+    best_params,
+    lgb_train_full,
+    valid_sets=[lgb_train_full, lgb_val_full],
+    num_boost_round=1500,
+    callbacks=[lgb.early_stopping(100)]
+)
+
+model_cb = CatBoostRegressor(
+    iterations=1000,
+    learning_rate=0.03,
+    depth=6,
+    loss_function="RMSE",
+    eval_metric="MAE",
+    cat_features=cat_feature_indices,
+    early_stopping_rounds=100,
+    task_type="GPU" if DEVICE == "cuda" else "CPU",
+    verbose=False,
+    random_seed=42
+)
+model_cb.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
+
+pred_lgb_val = model_lgb.predict(X_val)
+pred_cb_val = model_cb.predict(X_val)
+pred_ens_val = 0.7 * pred_lgb_val + 0.3 * pred_cb_val
+
+calibrator = LinearRegression().fit(pred_ens_val.reshape(-1, 1), y_val)
+pred_ens_test = 0.7 * model_lgb.predict(X_test) + 0.3 * model_cb.predict(X_test)
+final_pred = calibrator.predict(pred_ens_test.reshape(-1, 1))
+final_pred = np.clip(final_pred, RATING_MIN, RATING_MAX)
+
+submission = sample_sub.copy()
+submission["rating_predict"] = final_pred
+
+assert len(submission) == len(test)
+assert (submission["user_id"] == test["user_id"]).all()
+assert (submission["book_id"] == test["book_id"]).all()
+
+submission.to_csv(f"{OUTPUT_DIR}/submission_final.csv", index=False)
+print("Сабмит сохранен")
